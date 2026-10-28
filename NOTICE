@@ -1,0 +1,19 @@
+Holmes Agent: local SRE assistant
+https://github.com/aaditya-2905/Holmes-agent
+
+This product is a modified version of HolmesGPT
+(https://github.com/HolmesGPT/holmesgpt), a Cloud Native Computing Foundation
+sandbox project originally created by Robusta.Dev, with major contributions
+from Microsoft. HolmesGPT is licensed under the Apache License, Version 2.0.
+
+Based on upstream HolmesGPT commit 49804bde (2026-10-26).
+
+Modifications to the upstream code:
+
+  - Added:    local-sre/ (local-machine toolsets, agent config, agent
+              Dockerfile, web UI, setup and run scripts)
+  - Added:    .env.example
+  - Modified: docker-compose.yaml (replaced with the local agent + UI stack)
+  - Replaced: README.md
+
+All other files are unmodified from upstream HolmesGPT.
