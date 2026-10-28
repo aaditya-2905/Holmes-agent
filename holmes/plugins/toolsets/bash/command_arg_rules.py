@@ -110,6 +110,90 @@ def _uniq_reason(args: List[str]) -> Optional[str]:
     return None
 
 
+# --- journalctl ---------------------------------------------------------------
+# Maintenance options that rotate, flush, or delete journal files. They can appear
+# anywhere in the command, so a deny-list prefix (which only sees what follows
+# `journalctl`) cannot catch them. Matched by abbreviation like sort's long options.
+JOURNALCTL_MAINTENANCE_LONG_OPTS = frozenset(
+    {
+        "--vacuum-size",
+        "--vacuum-time",
+        "--vacuum-files",  # delete archived journal files
+        "--rotate",
+        "--flush",
+        "--relinquish-var",
+        "--smart-relinquish-var",  # rotate / move the journal
+        "--setup-keys",  # generate sealing keys
+        "--update-catalog",  # rewrite the message catalog
+    }
+)
+
+
+def _journalctl_reason(args: List[str]) -> Optional[str]:
+    """`journalctl --vacuum-*`/`--rotate`/`--flush`/… modify or delete journal files."""
+    options, _ = parse_argv(args, frozenset(), frozenset())
+    for opt in sorted(options):
+        if abbreviates(opt, JOURNALCTL_MAINTENANCE_LONG_OPTS):
+            return f"'journalctl {opt}' rotates, flushes or deletes journal files"
+    return None
+
+
+# --- ip -----------------------------------------------------------------------
+# `ip [OPTIONS] OBJECT [VERB]`: only the read verbs are allowed. Everything else
+# (add/del/change/replace/flush/set, `netns exec`, …) is refused. iproute2 accepts
+# abbreviated verbs and their meaning depends on the object (`ip l s` is `set`,
+# `ip a s` is `show`), so abbreviations cannot be verified statically and are
+# refused too: the full word `show` is always accepted. No verb means `show`.
+IP_READ_VERBS = frozenset({"show", "list", "lst", "get", "help"})
+# Global options that consume the next token, with the shortest abbreviation
+# iproute2 accepts (-f/-family, -n/-netns, -l/-loops, -rc/-rcvbuf).
+_IP_VALUE_OPTS = (("-family", 2), ("-netns", 2), ("-loops", 2), ("-rcvbuf", 3))
+
+
+def _ip_option_is(opt: str, full: str, min_len: int) -> bool:
+    return len(opt) >= min_len and full.startswith(opt)
+
+
+def _ip_reason(args: List[str]) -> Optional[str]:
+    """`ip` verbs other than show/list/get change network state or run commands."""
+    positionals: List[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("-") and arg != "-":
+            opt = arg[1:] if arg.startswith("--") else arg  # iproute2 accepts --opt
+            if _ip_option_is(opt, "-batch", 2):  # -b..-batch; -br is "brief"
+                return "'ip -batch' executes commands read from a file"
+            takes_value = any(_ip_option_is(opt, full, n) for full, n in _IP_VALUE_OPTS)
+            i += 2 if takes_value else 1
+            continue
+        positionals.append(arg)
+        i += 1
+    if len(positionals) >= 2 and positionals[1] not in IP_READ_VERBS:
+        return (
+            f"'ip {positionals[0]} {positionals[1]}' is not a read-only form; "
+            "only 'ip <object> show|list|get' is allowed, with the verb spelled out"
+        )
+    return None
+
+
+# --- dig ----------------------------------------------------------------------
+# -f reads query names from a file and -k reads a TSIG key file; both read local
+# files and send their contents to a DNS server. Short options that take a value
+# are listed so `-q -f` (a query named "-f") parses correctly.
+DIG_VALUE_SHORT_CHARS = frozenset("bcfkmpqtxy")
+
+
+def _dig_reason(args: List[str]) -> Optional[str]:
+    """`dig -f`/`-k` read local files and send their contents to a DNS server."""
+    options, _ = parse_argv(args, DIG_VALUE_SHORT_CHARS, frozenset())
+    if "-f" in options:
+        return "'dig -f' reads query names from a local file"
+    if "-k" in options:
+        return "'dig -k' reads a TSIG key from a local file"
+    return None
+
+
 # --- dispatch -----------------------------------------------------------------
 # Command basename -> checker. Private: callers use the functions below rather
 # than reaching into the registry.
@@ -117,6 +201,9 @@ _ARGV_CHECKERS = {
     "find": _find_reason,
     "sort": _sort_reason,
     "uniq": _uniq_reason,
+    "journalctl": _journalctl_reason,
+    "ip": _ip_reason,
+    "dig": _dig_reason,
 }
 
 

@@ -32,20 +32,19 @@ toolsets:
         - "dig"
         - "nslookup"
         - "host"
-        - "ip addr"
-        - "ip -br"
-        - "ip route"
-        - "ip -4 route"
-        - "ip -6 route"
-        - "ip neigh"
-        - "ip -s link"
-        - "ip link show"
+        # A prefix only sees the start of a command, so these entries are paired with
+        # argument checks in holmes/plugins/toolsets/bash/command_arg_rules.py:
+        # `ip` is limited to show/list/get, `journalctl` refuses --vacuum-*/--rotate/
+        # --flush/..., and `dig` refuses -f/-k (which read local files).
+        - "ip"
         - "ss -"
         - "resolvectl status"
         - "resolvectl query"
-        - "nmcli -t"
+        # Only forms whose subcommand is fixed by the prefix. `nmcli connection show`
+        # is left out: it accepts --show-secrets and would print saved Wi-Fi passwords.
         - "nmcli device status"
-        - "nmcli connection show"
+        - "nmcli -t device status"
+        - "nmcli general status"
         - "systemctl status"
         - "systemctl --user status"
         - "systemctl list-units"
@@ -55,7 +54,9 @@ toolsets:
         - "journalctl"
         - "docker ps"
         - "docker logs"
-        - "docker inspect"
+        # `docker inspect` is not auto-approved: it prints a container's environment,
+        # including the API key this stack passes to the agent container. Use the
+        # local_docker_container_details tool, which leaves the environment out.
         - "docker stats --no-stream"
         - "ps"
         - "pgrep"
@@ -67,9 +68,6 @@ toolsets:
         - "lsblk"
         - "nproc"
         - "lscpu"
-      deny:
-        - "journalctl --vacuum"
-        - "journalctl --rotate"
-        - "journalctl --flush"
-        - "journalctl --relinquish-var"
-        - "journalctl --setup-keys"
+      # No deny list: deny entries only match the first words of a command, so
+      # `journalctl -u ssh --rotate` slipped past `journalctl --rotate`. The
+      # argument checks in command_arg_rules.py cover those flags in any position.

@@ -17,8 +17,8 @@ what it found. Any command outside its allow list needs your approval in the UI.
 
 This repository is HolmesGPT at upstream commit
 [`49804bde`](https://github.com/HolmesGPT/holmesgpt/commit/49804bde) (2026-10-26) plus the
-changes below. Every other file, including `holmes/`, `server.py`, `helm/`, `docs/` and
-`tests/`, is the upstream code, unmodified.
+changes below. Every other file, including the rest of `holmes/`, `server.py`, `helm/`,
+`docs/` and `tests/`, is the upstream code, unmodified.
 
 | Change | Path | What it does |
 |---|---|---|
@@ -28,6 +28,8 @@ changes below. Every other file, including `holmes/`, `server.py`, `helm/`, `doc
 | Added | `local-sre/agent.Dockerfile` | Agent image with kubectl, the docker CLI and host-diagnostics tools (`dig`, `mtr`, `iproute2`, `systemctl`, `journalctl`, `sysstat`) |
 | Added | `local-sre/setup.sh`, `local-sre/run.sh` | One-time setup (group IDs, kubeconfig) and a way to run the agent without Docker |
 | Added | `.env.example` | API key, model, reasoning effort, ports, host group IDs |
+| Changed | `holmes/plugins/toolsets/bash/command_arg_rules.py` | Argument checks for `journalctl` (no `--vacuum-*`, `--rotate`, `--flush`), `ip` (read verbs only, no `-batch`) and `dig` (no `-f`/`-k`), so the bash allow-list can't be used to change the host or read local files |
+| Added | `tests/plugins/toolsets/bash/test_local_sre_bash_rules.py` | Tests for those checks and for which commands `local-sre/config.yaml` auto-approves |
 | Changed | `docker-compose.yaml` | Replaced upstream's single prebuilt-image service with a hardened `agent` + `ui` stack that can see the host |
 | Replaced | `README.md` | This file. Upstream's README is [on GitHub](https://github.com/HolmesGPT/holmesgpt#readme) |
 

@@ -14,6 +14,9 @@ Modifications to the upstream code:
               Dockerfile, web UI, setup and run scripts)
   - Added:    .env.example
   - Modified: docker-compose.yaml (replaced with the local agent + UI stack)
+  - Modified: holmes/plugins/toolsets/bash/command_arg_rules.py (added argument
+              checks for journalctl, ip and dig)
+  - Added:    tests/plugins/toolsets/bash/test_local_sre_bash_rules.py
   - Replaced: README.md
 
 All other files are unmodified from upstream HolmesGPT.
