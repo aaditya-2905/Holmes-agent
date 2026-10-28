@@ -1,0 +1,148 @@
+import json
+import logging
+from enum import Enum
+from functools import partial
+from typing import Generator, Optional, Union
+
+from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+from litellm.types.utils import ModelResponse, TextCompletionResponse
+from pydantic import BaseModel, Field
+
+from holmes.common.env_vars import TRACE_TOKEN_USAGE
+from holmes.core.error_info import ErrorInfo
+from holmes.core.llm import ContextWindowUsage, build_usage_metadata
+from holmes.core.llm_rate_limit import is_rate_limit_error
+from holmes.core.relay_refusal import RELAY_REFUSAL_ERROR_CODES, RelayRefusal
+
+
+class StreamEvents(str, Enum):
+    ANSWER_END = "ai_answer_end"
+    START_TOOL = "start_tool_calling"
+    TOOL_RESULT = "tool_calling_result"
+    ERROR = "error"
+    AI_MESSAGE = "ai_message"
+    APPROVAL_REQUIRED = "approval_required"
+    TOKEN_COUNT = "token_count"
+    CONVERSATION_HISTORY_COMPACTION_START = "conversation_history_compaction_start"
+    CONVERSATION_HISTORY_COMPACTED = "conversation_history_compacted"
+
+
+class StreamMessage(BaseModel):
+    event: StreamEvents
+    data: dict = Field(default={})
+
+
+def create_sse_message(event_type: str, data: Optional[dict] = None):
+    if data is None:
+        data = {}
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+def create_sse_error_message(
+    description: str,
+    error_code: int,
+    msg: str,
+    error_info: Optional[ErrorInfo] = None,
+):
+    data = {
+        "description": description,
+        "error_code": error_code,
+        "msg": msg,
+        "success": False,
+    }
+    if error_info is not None:
+        data.update(error_info.event_fields())
+    return create_sse_message(StreamEvents.ERROR.value, data)
+
+
+create_rate_limit_error_message = partial(
+    create_sse_error_message,
+    error_code=5204,
+    msg="Rate limit exceeded",
+)
+
+
+def stream_chat_formatter(
+    call_stream: Generator[StreamMessage, None, None],
+    model: Optional[str] = None,
+):
+    try:
+        for message in call_stream:
+            if message.event == StreamEvents.ANSWER_END:
+                if TRACE_TOKEN_USAGE:
+                    costs = message.data.get("costs", {})
+                    logging.info(
+                        f"Completed /api/chat request (stream) | model={model}, "
+                        f"input={costs.get('prompt_tokens')}, output={costs.get('completion_tokens')}, "
+                        f"cached={costs.get('cached_tokens')}, total={costs.get('total_tokens')}, "
+                        f"cost=${costs.get('total_cost', 0):.4f}"
+                    )
+                response_data = {
+                    "analysis": message.data.get("content"),
+                    "conversation_history": message.data.get("messages"),
+                    "metadata": message.data.get("metadata") or {},
+                }
+
+                yield create_sse_message(StreamEvents.ANSWER_END.value, response_data)
+            elif message.event == StreamEvents.APPROVAL_REQUIRED:
+                response_data = {
+                    "analysis": message.data.get("content"),
+                    "conversation_history": message.data.get("messages"),
+                    "requires_approval": True,
+                    "pending_approvals": message.data.get(
+                        "pending_approvals", []
+                    ),
+                    "pending_frontend_tool_calls": message.data.get(
+                        "pending_frontend_tool_calls", []
+                    ),
+                }
+
+                yield create_sse_message(
+                    StreamEvents.APPROVAL_REQUIRED.value, response_data
+                )
+            else:
+                yield create_sse_message(message.event.value, message.data)
+    except RelayRefusal as e:
+        # The platform refused the call; the stream's HTTP status is long
+        # committed, so the refusal rides the error event's code, with relay's
+        # own sentence as the text (ROB-1389).
+        logging.warning(f"Relay refused the streamed chat (status {e.status_code}): {e}")
+        yield create_sse_error_message(
+            description=str(e),
+            error_code=RELAY_REFUSAL_ERROR_CODES[e.status_code],
+            msg=str(e),
+            error_info=ErrorInfo.from_exception(e),
+        )
+    except Exception as e:
+        logging.error(f"Error during streaming chat: {e}", exc_info=True)
+        error_info = ErrorInfo.from_exception(e)
+        if is_rate_limit_error(e):
+            yield create_rate_limit_error_message(str(e), error_info=error_info)
+        else:
+            yield create_sse_error_message(
+                description=str(e), error_code=1, msg=str(e), error_info=error_info
+            )
+
+
+def add_token_count_to_metadata(
+    tokens: ContextWindowUsage,
+    metadata: dict,
+    max_context_size: int,
+    maximum_output_token: int,
+    full_llm_response: Union[
+        ModelResponse, CustomStreamWrapper, TextCompletionResponse
+    ],
+):
+    metadata["usage"] = build_usage_metadata(full_llm_response)
+    metadata["tokens"] = tokens.model_dump()
+    metadata["max_tokens"] = max_context_size
+    metadata["max_output_tokens"] = maximum_output_token
+
+
+def build_stream_event_token_count(metadata: dict) -> StreamMessage:
+    return StreamMessage(
+        event=StreamEvents.TOKEN_COUNT,
+        data={
+            "metadata": metadata,
+        },
+    )
