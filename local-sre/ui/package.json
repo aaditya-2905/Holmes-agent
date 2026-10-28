@@ -1,0 +1,22 @@
+{
+  "name": "holmes-local-ui",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build && node scripts/precompress.mjs",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "dompurify": "3.4.17",
+    "idb-keyval": "6.2.2",
+    "marked": "15.0.12",
+    "preact": "10.26.9"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "2.10.2",
+    "typescript": "5.8.3",
+    "vite": "6.3.5"
+  }
+}

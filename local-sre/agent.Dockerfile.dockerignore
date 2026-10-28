@@ -1,0 +1,10 @@
+# Build context is the repo root; send only what agent.Dockerfile copies.
+*
+!pyproject.toml
+!poetry.lock
+!server.py
+!holmes
+!bin/go-cve-rebuild
+!local-sre/toolsets
+**/__pycache__
+**/*.pyc

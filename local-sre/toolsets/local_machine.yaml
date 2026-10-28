@@ -1,0 +1,548 @@
+# Read-only diagnostics for the machine Holmes runs on: system, services, network, docker.
+#
+# SECURITY / templating rules used throughout this file:
+# - Params are shlex-quoted by Holmes. Assign each one to a shell variable in an
+#   unquoted assignment slot (T_X={{ x }}) and only ever reference "$T_X".
+# - Every user-supplied value is validated against a strict charset and must not
+#   start with '-', so it can never be parsed as an option (e.g. ping -f / dig -f).
+# - Shell variables are prefixed T_ because scripts pass through os.path.expandvars
+#   before rendering; an unprefixed $HOST or $PATH would be replaced by the server's env.
+# - Docker --format strings are wrapped in raw blocks so Jinja leaves them alone.
+# - Optional params render as "" when omitted and "None" when sent as null.
+
+toolsets:
+  local/system:
+    description: "Read-only health of the local machine: CPU, memory, disk, processes, pressure"
+    tags:
+      - core
+      - cli
+    prerequisites:
+      - command: "command -v ps && command -v free && command -v df"
+    llm_instructions: |
+      Holmes runs directly on the user's local Linux machine (not in Kubernetes).
+      For "machine is slow" / "something is hogging resources" questions, start with
+      local_system_overview, then local_resource_pressure, then drill into a process with
+      local_process_details. Report exact process names, PIDs and numbers.
+    tools:
+      - name: local_system_overview
+        user_description: "System overview"
+        description: >
+          One-shot snapshot of this machine: OS, kernel, uptime and load, CPU count, memory and
+          swap, mounted filesystems usage, top 10 processes by CPU and by memory, failed systemd units.
+          Call this first for any question about this machine's health.
+        script: |
+          #!/bin/bash
+          # In the container the host's / is mounted read-only at $HOST_ROOT; show only those
+          # mounts, with host paths. Natively HOST_ROOT is unset and nothing is filtered.
+          T_ROOT="${HOST_ROOT:-}"
+          # df lists each device once and may pick a container bind mount of it, so in the
+          # container use -a and keep only $T_ROOT mounts that have a size (drops pseudo fs).
+          host_mounts() { if [ -n "$T_ROOT" ]; then awk -v r="$T_ROOT" 'NR==1 {print; next} $3!="0" && $3!="-" && $NF !~ "^" r "/var/lib/docker/" && ($NF==r || index($NF, r "/")==1) {sub("^" r, "", $NF); if ($NF=="") $NF="/"; print}'; else cat; fi; }
+          T_FSX=(-x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs -x proc -x sysfs -x cgroup2 -x nsfs)
+          [ -n "$T_ROOT" ] && T_FSX+=(-a)
+          echo "== host =="; hostname; . "$T_ROOT/etc/os-release" 2>/dev/null && echo "$PRETTY_NAME"; uname -r
+          echo; echo "== uptime / load (CPUs: $(nproc)) =="; uptime
+          echo; echo "== memory =="; free -h
+          echo; echo "== filesystems =="; df -hT "${T_FSX[@]}" 2>/dev/null | host_mounts
+          echo; echo "== inodes (>=80% used) =="; df -i "${T_FSX[@]}" 2>/dev/null | host_mounts | awk 'NR==1 || int($5) >= 80'
+          echo; echo "== top 10 by CPU =="; ps -eo pid,user,pcpu,pmem,etime,comm --sort=-pcpu | head -11
+          echo; echo "== top 10 by memory =="; ps -eo pid,user,pcpu,pmem,rss,comm --sort=-rss | head -11
+          echo; echo "== failed system units =="; systemctl --failed --no-pager --no-legend 2>&1 | head -20
+          echo; echo "== failed user units =="; if [ -n "${XDG_RUNTIME_DIR:-}" ]; then systemctl --user --failed --no-pager --no-legend 2>&1 | head -20; else echo "(user-session units are not visible when the agent runs in a container)"; fi
+
+      - name: local_top_processes
+        user_description: "Top processes by {{ sort_by }}"
+        description: "List the top processes on this machine sorted by CPU or memory."
+        parameters:
+          sort_by:
+            type: string
+            enum: ["cpu", "memory"]
+            description: "Sort key"
+          limit:
+            type: integer
+            required: false
+            description: "How many processes to show (default 20, max 100)"
+        script: |
+          #!/bin/bash
+          T_SORT={{ sort_by }}
+          T_LIMIT={{ limit }}
+          [ "$T_LIMIT" = "None" ] || [ -z "$T_LIMIT" ] && T_LIMIT=20
+          printf '%s' "$T_LIMIT" | grep -Eq '^[0-9]+$' || { echo "ERROR: limit must be a number, got '$T_LIMIT'"; exit 2; }
+          [ "$T_LIMIT" -gt 100 ] && T_LIMIT=100
+          case "$T_SORT" in
+            cpu) T_KEY=-pcpu ;;
+            memory) T_KEY=-rss ;;
+            *) echo "ERROR: sort_by must be 'cpu' or 'memory', got '$T_SORT'"; exit 2 ;;
+          esac
+          echo "Top $T_LIMIT processes sorted by $T_SORT:"
+          ps -eo pid,ppid,user,pcpu,pmem,rss,etime,stat,args --sort="$T_KEY" | cut -c1-220 | head -n $((T_LIMIT + 1))
+
+      - name: local_process_details
+        user_description: "Process details: {{ process }}"
+        description: >
+          Details for processes matching a PID or a process name: full command line, start time,
+          CPU/memory, thread count, open network sockets and open file count.
+        parameters:
+          process:
+            type: string
+            description: "A PID (e.g. 1234) or a process name substring (e.g. nginx, postgres)"
+        script: |
+          #!/bin/bash
+          T_PROC={{ process }}
+          case "$T_PROC" in -*|""|None) echo "ERROR: invalid process '$T_PROC'"; exit 2 ;; esac
+          printf '%s' "$T_PROC" | grep -Eq '^[A-Za-z0-9._@:+-]+$' || { echo "ERROR: process contains invalid characters: '$T_PROC'"; exit 2; }
+          if printf '%s' "$T_PROC" | grep -Eq '^[0-9]+$'; then
+            T_PIDS="$T_PROC"
+          else
+            T_PIDS=$(pgrep -f -- "$T_PROC" | grep -v "^$$\$" | head -10 | tr '\n' ' ')
+          fi
+          if [ -z "$T_PIDS" ]; then echo "No running process matches '$T_PROC' (searched with pgrep -f)."; exit 0; fi
+          for T_PID in $T_PIDS; do
+            [ -d "/proc/$T_PID" ] || { echo "PID $T_PID does not exist"; continue; }
+            echo "===== PID $T_PID ====="
+            ps -o pid,ppid,user,lstart,etime,pcpu,pmem,rss,nlwp,stat -p "$T_PID"
+            echo "cmd: $(tr '\0' ' ' < /proc/$T_PID/cmdline 2>/dev/null | cut -c1-500)"
+            echo "open files: $(ls /proc/$T_PID/fd 2>/dev/null | wc -l) (limit: $(awk '/Max open files/ {print $4}' /proc/$T_PID/limits 2>/dev/null))"
+            echo "network sockets:"; ss -tunap 2>/dev/null | grep -E "pid=$T_PID," | head -30
+          done
+
+      - name: local_resource_pressure
+        user_description: "CPU / memory / IO pressure"
+        description: >
+          Samples CPU, memory, swap and disk I/O pressure over ~5 seconds (vmstat, iostat, Linux PSI).
+          Use to tell whether the machine is CPU-bound, memory-bound (swapping) or I/O-bound right now.
+        script: |
+          #!/bin/bash
+          echo "== vmstat 1s x5 (r=run queue, si/so=swap in/out, wa=io wait) =="; vmstat 1 5
+          if command -v iostat >/dev/null; then echo; echo "== iostat extended (2nd sample is current) =="; iostat -xz 1 2 | tail -n +1 | head -60; fi
+          echo; echo "== pressure stall information (avg10/60/300 %) =="
+          for T_R in cpu memory io; do [ -r /proc/pressure/$T_R ] && { echo "-- $T_R"; cat /proc/pressure/$T_R; }; done
+
+      - name: local_disk_usage
+        user_description: "Disk usage: {{ path }}"
+        description: >
+          Show usage of the filesystem holding a path and the largest sub-directories directly under it
+          (same filesystem only). Use to find what is filling a disk.
+        parameters:
+          path:
+            type: string
+            description: "Absolute directory path, e.g. /var or /home/user"
+        script: |
+          #!/bin/bash
+          T_PATH={{ path }}
+          case "$T_PATH" in /*) ;; *) echo "ERROR: path must be absolute, got '$T_PATH'"; exit 2 ;; esac
+          printf '%s' "$T_PATH" | grep -Eq '^[A-Za-z0-9._/@+-]+$' || { echo "ERROR: path contains invalid characters: '$T_PATH'"; exit 2; }
+          # In the container the host's / is mounted read-only at $HOST_ROOT.
+          T_ROOT="${HOST_ROOT:-}"
+          T_REAL="$T_ROOT$T_PATH"
+          [ -d "$T_REAL" ] || { echo "ERROR: '$T_PATH' is not a directory"; exit 2; }
+          to_host() { if [ -n "$T_ROOT" ]; then sed -e "s|[[:space:]]$T_ROOT/| /|g" -e "s|[[:space:]]$T_ROOT\$| /|"; else cat; fi; }
+          df -hT -- "$T_REAL" | to_host
+          echo; echo "Largest entries under $T_PATH (up to 60s scan, unreadable dirs skipped):"
+          timeout 60 du -xh --max-depth=1 -- "$T_REAL" 2>/dev/null | sort -rh | head -25 | to_host
+          [ "${PIPESTATUS[0]}" = "124" ] && echo "(scan timed out after 60s - results are partial)"
+          exit 0
+
+  local/services:
+    description: "Read-only systemd service status and journald logs on the local machine"
+    tags:
+      - core
+      - cli
+    prerequisites:
+      - command: "command -v systemctl && command -v journalctl"
+    llm_instructions: |
+      The current user may only be able to read its own (user) journal. If system logs come back
+      empty or with a permission note, say so explicitly and tell the user that adding their account
+      to the 'systemd-journal' group (sudo usermod -aG systemd-journal $USER, then re-login) grants access.
+    tools:
+      - name: local_failed_services
+        user_description: "Failed systemd units"
+        description: "List failed systemd units, both system-wide and for the current user session."
+        script: |
+          #!/bin/bash
+          echo "== failed system units =="; systemctl --failed --no-pager 2>&1 | head -40
+          echo; echo "== failed user units =="; if [ -n "${XDG_RUNTIME_DIR:-}" ]; then systemctl --user --failed --no-pager 2>&1 | head -40; else echo "(user-session units are not visible when the agent runs in a container)"; fi
+
+      - name: local_service_status
+        user_description: "systemctl status {{ unit }}"
+        description: "Show systemd status of a unit (system or user), including active state, PID, memory and recent restarts."
+        parameters:
+          unit:
+            type: string
+            description: "Unit name, e.g. nginx, docker.service, ssh"
+        script: |
+          #!/bin/bash
+          T_UNIT={{ unit }}
+          case "$T_UNIT" in -*|""|None) echo "ERROR: invalid unit '$T_UNIT'"; exit 2 ;; esac
+          printf '%s' "$T_UNIT" | grep -Eq '^[A-Za-z0-9._@:\\-]+$' || { echo "ERROR: unit contains invalid characters: '$T_UNIT'"; exit 2; }
+          if systemctl list-units --all --no-legend -- "$T_UNIT" "$T_UNIT.service" 2>/dev/null | grep -q .; then
+            echo "== system unit =="; systemctl status --no-pager -n 0 -- "$T_UNIT" 2>&1 | head -40
+            echo; systemctl show -p NRestarts -p Result -p ExecMainStatus -p ActiveEnterTimestamp -- "$T_UNIT" 2>/dev/null
+          elif systemctl --user list-units --all --no-legend -- "$T_UNIT" "$T_UNIT.service" 2>/dev/null | grep -q .; then
+            echo "== user unit =="; systemctl --user status --no-pager -n 0 -- "$T_UNIT" 2>&1 | head -40
+          else
+            echo "No system or user unit matches '$T_UNIT'. Similar units:"
+            systemctl list-unit-files --no-legend --no-pager 2>/dev/null | grep -i -- "$T_UNIT" | head -15
+          fi
+          exit 0
+
+      - name: local_service_logs
+        user_description: "journalctl -u {{ unit }}"
+        description: >
+          Fetch journald logs for one systemd unit (system or user). Supports a time window and an
+          optional case-insensitive regex filter.
+        parameters:
+          unit:
+            type: string
+            description: "Unit name, e.g. nginx or docker.service"
+          since:
+            type: string
+            required: false
+            description: "journalctl --since value, e.g. '1 hour ago', '30 min ago', 'today', '2026-10-28 09:00'. Default '1 hour ago'"
+          lines:
+            type: integer
+            required: false
+            description: "Max lines to return (default 200, max 1000)"
+          grep:
+            type: string
+            required: false
+            description: "Optional regex to filter log messages (case-insensitive), e.g. 'error|timeout'"
+        script: |
+          #!/bin/bash
+          T_UNIT={{ unit }}
+          T_SINCE={{ since }}
+          T_LINES={{ lines }}
+          T_GREP={{ grep }}
+          case "$T_UNIT" in -*|""|None) echo "ERROR: invalid unit '$T_UNIT'"; exit 2 ;; esac
+          printf '%s' "$T_UNIT" | grep -Eq '^[A-Za-z0-9._@:\\-]+$' || { echo "ERROR: unit contains invalid characters: '$T_UNIT'"; exit 2; }
+          { [ "$T_SINCE" = "None" ] || [ -z "$T_SINCE" ]; } && T_SINCE="1 hour ago"
+          printf '%s' "$T_SINCE" | grep -Eq '^[A-Za-z0-9 :+-]+$' || { echo "ERROR: since contains invalid characters: '$T_SINCE'"; exit 2; }
+          { [ "$T_LINES" = "None" ] || [ -z "$T_LINES" ]; } && T_LINES=200
+          printf '%s' "$T_LINES" | grep -Eq '^[0-9]+$' || { echo "ERROR: lines must be a number"; exit 2; }
+          [ "$T_LINES" -gt 1000 ] && T_LINES=1000
+          [ "$T_GREP" = "None" ] && T_GREP=""
+          # --since with -n yields the OLDEST n entries in the window; callers add -r and pipe to tac.
+          T_ARGS=(--no-pager -o short-iso --since "$T_SINCE" -n "$T_LINES")
+          [ -n "$T_GREP" ] && T_ARGS+=(--grep "$T_GREP" --case-sensitive=false)
+          echo "Logs for unit '$T_UNIT' since '$T_SINCE', last $T_LINES lines${T_GREP:+, filtered by regex '$T_GREP'}:"
+          echo "== system journal =="; journalctl -u "$T_UNIT" "${T_ARGS[@]}" -r 2>&1 | tac
+          case "$T_UNIT" in *.*) T_UNIT_FULL="$T_UNIT" ;; *) T_UNIT_FULL="$T_UNIT.service" ;; esac
+          echo; echo "== user-session journal =="; journalctl "_SYSTEMD_USER_UNIT=$T_UNIT_FULL" "${T_ARGS[@]}" -r 2>&1 | tac
+          exit 0
+
+      - name: local_journal_errors
+        user_description: "Journal errors"
+        description: "Recent error-level (and worse) log entries across all units in the journal, system and user."
+        parameters:
+          since:
+            type: string
+            required: false
+            description: "journalctl --since value. Default '1 hour ago'"
+          lines:
+            type: integer
+            required: false
+            description: "Max lines (default 150, max 1000)"
+        script: |
+          #!/bin/bash
+          T_SINCE={{ since }}
+          T_LINES={{ lines }}
+          { [ "$T_SINCE" = "None" ] || [ -z "$T_SINCE" ]; } && T_SINCE="1 hour ago"
+          printf '%s' "$T_SINCE" | grep -Eq '^[A-Za-z0-9 :+-]+$' || { echo "ERROR: since contains invalid characters: '$T_SINCE'"; exit 2; }
+          { [ "$T_LINES" = "None" ] || [ -z "$T_LINES" ]; } && T_LINES=150
+          printf '%s' "$T_LINES" | grep -Eq '^[0-9]+$' || { echo "ERROR: lines must be a number"; exit 2; }
+          [ "$T_LINES" -gt 1000 ] && T_LINES=1000
+          echo "Priority err..emerg since '$T_SINCE', last $T_LINES lines:"
+          echo "== all readable journals (system + user sessions) =="; journalctl -p err --no-pager -o short-iso --since "$T_SINCE" -n "$T_LINES" -r 2>&1 | tac
+          echo; echo "== kernel (dmesg) =="; journalctl -k -p warning --no-pager -o short-iso --since "$T_SINCE" -n 50 -r 2>&1 | tac
+          exit 0
+
+  local/network:
+    description: "Read-only network diagnostics from the local machine: interfaces, routes, DNS, ping, traceroute, sockets, HTTP and TLS checks"
+    tags:
+      - core
+      - cli
+    prerequisites:
+      - command: "command -v ip && command -v ss && command -v ping"
+    llm_instructions: |
+      Holmes runs directly on the user's machine, so these tools see the real LAN/VPN/Internet path.
+      For "can't reach X" problems, walk the layers bottom-up and stop explaining only once you find the
+      broken layer: (1) local_network_overview - link up, IP assigned, default route, DNS servers;
+      (2) local_dns_lookup on the target name, also against a public resolver (1.1.1.1) to separate
+      local-DNS problems from real NXDOMAIN; (3) local_ping the default gateway, then the target;
+      (4) local_trace_route to find the hop where loss starts; (5) tcp_check / local_http_check /
+      local_tls_check for the actual service port. ICMP being blocked does not mean the host is down -
+      confirm with a TCP check before concluding. Always quote the exact IPs, hops, latencies and loss %.
+    tools:
+      - name: local_network_overview
+        user_description: "Network overview"
+        description: >
+          Interfaces with state and addresses, IPv4/IPv6 routes, default gateway, DNS configuration,
+          NetworkManager device state and VPN/tunnel interfaces. Call first for any network question.
+        script: |
+          #!/bin/bash
+          echo "== interfaces =="; ip -br addr
+          echo; echo "== IPv4 routes =="; ip -4 route
+          echo; echo "== IPv6 default route =="; ip -6 route show default 2>/dev/null
+          echo; echo "== DNS =="
+          if command -v resolvectl >/dev/null; then resolvectl dns 2>/dev/null; resolvectl domain 2>/dev/null | grep -v ':$'; else grep -E '^(nameserver|search)' /etc/resolv.conf; fi
+          if command -v nmcli >/dev/null; then echo; echo "== NetworkManager devices =="; nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device 2>/dev/null; fi
+          echo; echo "== socket summary =="; ss -s | head -8
+
+      - name: local_ping
+        user_description: "ping {{ host }}"
+        description: "Ping a host or IP from this machine and report packet loss and latency."
+        parameters:
+          host:
+            type: string
+            description: "Hostname or IP address"
+          count:
+            type: integer
+            required: false
+            description: "Number of packets (default 5, max 20)"
+        script: |
+          #!/bin/bash
+          T_HOST={{ host }}
+          T_COUNT={{ count }}
+          case "$T_HOST" in -*|""|None) echo "ERROR: invalid host '$T_HOST'"; exit 2 ;; esac
+          printf '%s' "$T_HOST" | grep -Eq '^[A-Za-z0-9._:%-]+$' || { echo "ERROR: host contains invalid characters: '$T_HOST'"; exit 2; }
+          { [ "$T_COUNT" = "None" ] || [ -z "$T_COUNT" ]; } && T_COUNT=5
+          printf '%s' "$T_COUNT" | grep -Eq '^[0-9]+$' || { echo "ERROR: count must be a number"; exit 2; }
+          [ "$T_COUNT" -gt 20 ] && T_COUNT=20
+          [ "$T_COUNT" -lt 1 ] && T_COUNT=1
+          echo "\$ ping -c $T_COUNT -W 2 $T_HOST"
+          ping -c "$T_COUNT" -W 2 -- "$T_HOST" 2>&1
+          T_RC=$?
+          [ $T_RC -ne 0 ] && echo "(ping exit code $T_RC: 1 = no replies, 2 = error such as unknown host. No reply may just mean ICMP is filtered - verify with a TCP check.)"
+          exit 0
+
+      - name: local_trace_route
+        user_description: "traceroute {{ host }}"
+        description: "Trace the network path to a host and show per-hop loss and latency (mtr report, falls back to tracepath)."
+        parameters:
+          host:
+            type: string
+            description: "Hostname or IP address"
+        script: |
+          #!/bin/bash
+          T_HOST={{ host }}
+          case "$T_HOST" in -*|""|None) echo "ERROR: invalid host '$T_HOST'"; exit 2 ;; esac
+          printf '%s' "$T_HOST" | grep -Eq '^[A-Za-z0-9._:%-]+$' || { echo "ERROR: host contains invalid characters: '$T_HOST'"; exit 2; }
+          if command -v mtr >/dev/null; then
+            echo "\$ mtr --report --report-cycles 5 -n -w $T_HOST"
+            timeout 60 mtr --report --report-cycles 5 -n -w -- "$T_HOST" 2>&1 && exit 0
+            echo "(mtr failed, falling back to tracepath)"
+          fi
+          echo "\$ tracepath -n -m 25 $T_HOST"
+          timeout 60 tracepath -n -m 25 -- "$T_HOST" 2>&1
+          exit 0
+
+      - name: local_dns_lookup
+        user_description: "dig {{ name }} {{ record_type }}"
+        description: >
+          Resolve a DNS name with dig, optionally against a specific DNS server, and show the answer,
+          TTLs, status (NOERROR/NXDOMAIN/SERVFAIL) and which server answered.
+        parameters:
+          name:
+            type: string
+            description: "Name to resolve, e.g. example.com, or an IP for a reverse (PTR) lookup"
+          record_type:
+            type: string
+            required: false
+            enum: ["A", "AAAA", "CNAME", "MX", "NS", "TXT", "SRV", "SOA", "PTR", "ANY"]
+            description: "Record type (default A)"
+          server:
+            type: string
+            required: false
+            description: "DNS server IP/host to query instead of the system resolver, e.g. 1.1.1.1"
+        script: |
+          #!/bin/bash
+          T_NAME={{ name }}
+          T_TYPE={{ record_type }}
+          T_SERVER={{ server }}
+          case "$T_NAME" in -*|""|None) echo "ERROR: invalid name '$T_NAME'"; exit 2 ;; esac
+          printf '%s' "$T_NAME" | grep -Eq '^[A-Za-z0-9._:-]+$' || { echo "ERROR: name contains invalid characters: '$T_NAME'"; exit 2; }
+          { [ "$T_TYPE" = "None" ] || [ -z "$T_TYPE" ]; } && T_TYPE=A
+          printf '%s' "$T_TYPE" | grep -Eq '^(A|AAAA|CNAME|MX|NS|TXT|SRV|SOA|PTR|ANY)$' || { echo "ERROR: unsupported record_type '$T_TYPE'"; exit 2; }
+          [ "$T_SERVER" = "None" ] && T_SERVER=""
+          T_ARGS=(+time=3 +tries=1 +nocmd +noquestion +stats)
+          if [ -n "$T_SERVER" ]; then
+            case "$T_SERVER" in -*) echo "ERROR: invalid server '$T_SERVER'"; exit 2 ;; esac
+            printf '%s' "$T_SERVER" | grep -Eq '^[A-Za-z0-9._:-]+$' || { echo "ERROR: server contains invalid characters"; exit 2; }
+            T_ARGS+=("@$T_SERVER")
+          fi
+          if printf '%s' "$T_NAME" | grep -Eq '^[0-9.]+$|:'; then
+            echo "\$ dig ${T_SERVER:+@$T_SERVER }-x $T_NAME"; dig "${T_ARGS[@]}" -x "$T_NAME" 2>&1
+          else
+            echo "\$ dig ${T_SERVER:+@$T_SERVER }$T_NAME $T_TYPE"; dig "${T_ARGS[@]}" -q "$T_NAME" -t "$T_TYPE" 2>&1
+          fi
+          exit 0
+
+      - name: local_listening_ports
+        user_description: "Listening ports"
+        description: "List TCP/UDP ports this machine is listening on, with owning process when visible. Optionally filter to one port."
+        parameters:
+          port:
+            type: integer
+            required: false
+            description: "Only show this port"
+        script: |
+          #!/bin/bash
+          T_PORT={{ port }}
+          { [ "$T_PORT" = "None" ] || [ -z "$T_PORT" ]; } && T_PORT=""
+          if [ -n "$T_PORT" ]; then
+            printf '%s' "$T_PORT" | grep -Eq '^[0-9]{1,5}$' || { echo "ERROR: port must be a number"; exit 2; }
+            echo "Listening sockets on port $T_PORT:"
+            ss -tulpnH "( sport = :$T_PORT )" 2>&1
+            echo "(process names are only shown for sockets owned by the current user)"
+          else
+            echo "All listening TCP/UDP sockets (process names only for sockets owned by the current user):"
+            ss -tulpn 2>&1 | head -150
+          fi
+
+      - name: local_connections
+        user_description: "TCP connections"
+        description: >
+          Active TCP connections from/to this machine, optionally filtered by remote/local port or remote
+          address, plus counts by TCP state. Use for connection leaks, TIME_WAIT/CLOSE_WAIT buildup,
+          or "who is talking to port X".
+        parameters:
+          port:
+            type: integer
+            required: false
+            description: "Filter to connections where local or remote port equals this"
+          address:
+            type: string
+            required: false
+            description: "Filter to connections with this remote IP address"
+        script: |
+          #!/bin/bash
+          T_PORT={{ port }}
+          T_ADDR={{ address }}
+          { [ "$T_PORT" = "None" ] || [ -z "$T_PORT" ]; } && T_PORT=""
+          { [ "$T_ADDR" = "None" ] || [ -z "$T_ADDR" ]; } && T_ADDR=""
+          T_FILTER=""
+          if [ -n "$T_PORT" ]; then
+            printf '%s' "$T_PORT" | grep -Eq '^[0-9]{1,5}$' || { echo "ERROR: port must be a number"; exit 2; }
+            T_FILTER="( sport = :$T_PORT or dport = :$T_PORT )"
+          fi
+          if [ -n "$T_ADDR" ]; then
+            printf '%s' "$T_ADDR" | grep -Eq '^[0-9A-Fa-f.:]+$' || { echo "ERROR: address must be an IP address"; exit 2; }
+            T_FILTER="${T_FILTER:+$T_FILTER and }dst $T_ADDR"
+          fi
+          echo "== TCP connections by state ${T_FILTER:+(filter: $T_FILTER)} =="
+          ss -tanH ${T_FILTER:+"$T_FILTER"} 2>&1 | awk '{print $1}' | sort | uniq -c | sort -rn
+          echo; echo "== connections (max 100) =="
+          ss -tanp ${T_FILTER:+"$T_FILTER"} 2>&1 | head -101
+
+      - name: local_http_check
+        user_description: "HTTP GET {{ url }}"
+        description: >
+          Make an HTTP(S) GET request from this machine and report status code, redirects, response
+          headers and timing breakdown (DNS, TCP connect, TLS, first byte, total). Body is not returned.
+        parameters:
+          url:
+            type: string
+            description: "Full URL starting with http:// or https://"
+        script: |
+          #!/bin/bash
+          T_URL={{ url }}
+          case "$T_URL" in http://*|https://*) ;; *) echo "ERROR: url must start with http:// or https://, got '$T_URL'"; exit 2 ;; esac
+          printf '%s' "$T_URL" | grep -Eq '^[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+$' || { echo "ERROR: url contains invalid characters"; exit 2; }
+          echo "\$ curl -sS -L --max-redirs 5 -m 15 -o /dev/null -D - $T_URL"
+          curl -sS -L --max-redirs 5 -m 15 -o /dev/null -D - --proto =http,https \
+            -w '\n-- timing --\nresolved_ip: %{remote_ip}:%{remote_port}\nhttp_code: %{http_code}\nredirects: %{num_redirects}\ndns: %{time_namelookup}s\nconnect: %{time_connect}s\ntls: %{time_appconnect}s\nfirst_byte: %{time_starttransfer}s\ntotal: %{time_total}s\n' \
+            -- "$T_URL" 2>&1 | head -80
+          exit 0
+
+      - name: local_tls_check
+        user_description: "TLS certificate {{ host }}"
+        description: "Check the TLS certificate served at host:port: subject, issuer, SANs, validity dates and whether the chain verifies."
+        parameters:
+          host:
+            type: string
+            description: "Hostname (used for SNI and verification)"
+          port:
+            type: integer
+            required: false
+            description: "Port (default 443)"
+        script: |
+          #!/bin/bash
+          T_HOST={{ host }}
+          T_PORT={{ port }}
+          case "$T_HOST" in -*|""|None) echo "ERROR: invalid host '$T_HOST'"; exit 2 ;; esac
+          printf '%s' "$T_HOST" | grep -Eq '^[A-Za-z0-9._-]+$' || { echo "ERROR: host contains invalid characters: '$T_HOST'"; exit 2; }
+          { [ "$T_PORT" = "None" ] || [ -z "$T_PORT" ]; } && T_PORT=443
+          printf '%s' "$T_PORT" | grep -Eq '^[0-9]{1,5}$' || { echo "ERROR: port must be a number"; exit 2; }
+          T_OUT=$(timeout 15 openssl s_client -connect "$T_HOST:$T_PORT" -servername "$T_HOST" -verify_hostname "$T_HOST" </dev/null 2>&1)
+          echo "$T_OUT" | grep -E '^(Verify return code|Verification error|CONNECTED|connect:|.*errno)' | head -5
+          echo "$T_OUT" | openssl x509 -noout -subject -issuer -dates -ext subjectAltName 2>&1 | head -20
+          exit 0
+
+      - name: local_interface_stats
+        user_description: "Interface counters"
+        description: "Per-interface RX/TX packet, error and drop counters, MTU and link state. Use for flaky links, packet loss or MTU problems."
+        script: |
+          #!/bin/bash
+          ip -s -h link 2>&1 | head -120
+          echo; echo "== neighbours (ARP/NDP table) =="; ip neigh 2>&1 | head -60
+
+  local/docker:
+    description: "Read-only Docker container status, health, logs and resource usage on the local machine"
+    tags:
+      - core
+      - cli
+    prerequisites:
+      - command: "docker info --format ok"
+    tools:
+      - name: local_docker_containers
+        user_description: "docker ps -a"
+        description: "List all Docker containers (running and stopped) with status, health, image, ports and restart count."
+        script: |
+          #!/bin/bash
+          {% raw %}docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}' 2>&1 | head -100{% endraw %}
+
+      - name: local_docker_container_details
+        user_description: "docker inspect {{ container }}"
+        description: "Inspect one container: state, exit code, OOMKilled, restart count, health-check log, networks, mounts, and live CPU/memory usage."
+        parameters:
+          container:
+            type: string
+            description: "Container name or ID"
+        script: |
+          #!/bin/bash
+          T_C={{ container }}
+          case "$T_C" in -*|""|None) echo "ERROR: invalid container '$T_C'"; exit 2 ;; esac
+          printf '%s' "$T_C" | grep -Eq '^[A-Za-z0-9._-]+$' || { echo "ERROR: container contains invalid characters"; exit 2; }
+          docker inspect -- "$T_C" 2>&1 | jq '.[0] | if . == null then "not found" else {Name, Image: .Config.Image, Created, RestartCount, State: (.State | del(.Health.Log)), HealthLog: (.State.Health.Log // [] | .[-5:]), RestartPolicy: .HostConfig.RestartPolicy, Memory: .HostConfig.Memory, Networks: (.NetworkSettings.Networks | map_values({IPAddress, Gateway})), Ports: .NetworkSettings.Ports, Mounts: [.Mounts[] | {Source, Destination, RW}]} end' 2>&1 || true
+          echo; echo "== live usage =="
+          {% raw %}docker stats --no-stream --format 'cpu={{.CPUPerc}} mem={{.MemUsage}} ({{.MemPerc}}) net={{.NetIO}} block={{.BlockIO}} pids={{.PIDs}}' -- "$T_C" 2>&1{% endraw %}
+
+      - name: local_docker_logs
+        user_description: "docker logs {{ container }}"
+        description: "Fetch logs of one Docker container with an optional time window and line limit."
+        parameters:
+          container:
+            type: string
+            description: "Container name or ID"
+          since:
+            type: string
+            required: false
+            description: "Relative duration like 10m, 1h, 24h (default 1h)"
+          lines:
+            type: integer
+            required: false
+            description: "Max lines (default 200, max 1000)"
+        script: |
+          #!/bin/bash
+          T_C={{ container }}
+          T_SINCE={{ since }}
+          T_LINES={{ lines }}
+          case "$T_C" in -*|""|None) echo "ERROR: invalid container '$T_C'"; exit 2 ;; esac
+          printf '%s' "$T_C" | grep -Eq '^[A-Za-z0-9._-]+$' || { echo "ERROR: container contains invalid characters"; exit 2; }
+          { [ "$T_SINCE" = "None" ] || [ -z "$T_SINCE" ]; } && T_SINCE=1h
+          printf '%s' "$T_SINCE" | grep -Eq '^[0-9]+[smhd]?$' || { echo "ERROR: since must look like 10m, 1h, 24h"; exit 2; }
+          { [ "$T_LINES" = "None" ] || [ -z "$T_LINES" ]; } && T_LINES=200
+          printf '%s' "$T_LINES" | grep -Eq '^[0-9]+$' || { echo "ERROR: lines must be a number"; exit 2; }
+          [ "$T_LINES" -gt 1000 ] && T_LINES=1000
+          echo "Logs of container '$T_C' from last $T_SINCE, last $T_LINES lines (stdout+stderr):"
+          docker logs --timestamps --since "$T_SINCE" --tail "$T_LINES" -- "$T_C" 2>&1

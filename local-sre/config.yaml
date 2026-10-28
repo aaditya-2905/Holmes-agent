@@ -1,0 +1,75 @@
+# HolmesGPT config for running directly on this machine (see local-sre/README.md).
+# The model comes from $MODEL and the key from $OPENROUTER_API_KEY (or another provider's key env var).
+# Paths are relative to the repo root; run.sh starts the server from there.
+
+custom_toolsets:
+  - local-sre/toolsets/local_machine.yaml
+
+toolsets:
+  # Kubernetes tools stay available for the clusters in ~/.kube/config.
+  kubernetes/core:
+    enabled: true
+  kubernetes/logs:
+    enabled: true
+  kubernetes/live-metrics:
+    enabled: true
+
+  connectivity_check:
+    enabled: true
+  internet:
+    enabled: true
+
+  bash:
+    enabled: true
+    config:
+      builtin_allowlist: "core"
+      # Read-only commands auto-approved on top of the core list. Anything else
+      # comes back as a pending approval in the /api/chat response.
+      allow:
+        - "ping -c"
+        - "tracepath"
+        - "mtr --report"
+        - "dig"
+        - "nslookup"
+        - "host"
+        - "ip addr"
+        - "ip -br"
+        - "ip route"
+        - "ip -4 route"
+        - "ip -6 route"
+        - "ip neigh"
+        - "ip -s link"
+        - "ip link show"
+        - "ss -"
+        - "resolvectl status"
+        - "resolvectl query"
+        - "nmcli -t"
+        - "nmcli device status"
+        - "nmcli connection show"
+        - "systemctl status"
+        - "systemctl --user status"
+        - "systemctl list-units"
+        - "systemctl --failed"
+        - "systemctl is-active"
+        - "systemctl show"
+        - "journalctl"
+        - "docker ps"
+        - "docker logs"
+        - "docker inspect"
+        - "docker stats --no-stream"
+        - "ps"
+        - "pgrep"
+        - "free"
+        - "df"
+        - "uptime"
+        - "vmstat"
+        - "iostat"
+        - "lsblk"
+        - "nproc"
+        - "lscpu"
+      deny:
+        - "journalctl --vacuum"
+        - "journalctl --rotate"
+        - "journalctl --flush"
+        - "journalctl --relinquish-var"
+        - "journalctl --setup-keys"

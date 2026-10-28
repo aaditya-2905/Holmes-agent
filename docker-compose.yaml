@@ -1,0 +1,90 @@
+# HolmesGPT local SRE stack: the agent plus its web UI, in one command.
+#
+#   cp .env.example .env      # then set your API key and MODEL (first time only)
+#   docker compose up -d --build
+#
+# UI:  http://127.0.0.1:${UI_PORT:-8088}      Agent API: http://127.0.0.1:${HOLMES_PORT:-5050}
+#
+# Both services use the host network and bind to 127.0.0.1 only, so the agent sees the
+# machine's real interfaces/routes and nothing is exposed to the LAN.
+# Details and the security model: local-sre/README.md
+
+name: holmesgpt
+
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: local-sre/agent.Dockerfile
+    image: holmes-local-agent:latest
+    restart: unless-stopped
+    network_mode: host
+    pid: host                     # see the host's processes, not just the container's
+    # 'nobody' exists on the host, which the host D-Bus requires before it answers
+    # systemctl status queries. Writes (start/stop/restart) are refused by the
+    # host's polkit for this user, so service inspection stays read-only.
+    user: "65534:65534"
+    group_add:
+      - "${DOCKER_GID:?set DOCKER_GID in .env (getent group docker)}"                   # docker.sock: container status/logs
+      - "${JOURNAL_GID:?set JOURNAL_GID in .env (getent group systemd-journal)}"        # read the full system journal
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_RAW]            # ping / mtr
+    # Docker's default AppArmor profile blocks D-Bus, which systemctl needs.
+    # The process is non-root with no capabilities beyond NET_RAW and a read-only rootfs.
+    security_opt:
+      - apparmor=unconfined
+    tmpfs:
+      - /tmp:exec,mode=1777       # script tools are written to /tmp and executed (tmpfs is noexec by default)
+      - /data
+    # MODEL, API keys and HOLMES_PORT come straight from .env. Read as an env_file (not
+    # ${VAR} interpolation) so a stale `export MODEL=...` in your shell can't override it.
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      HOLMES_HOST: 127.0.0.1
+      KUBECONFIG: /kube/config
+      HOST_ROOT: /host            # local/* tools read host df / os-release through this
+      # Forwarded request headers containing shell metacharacters (e.g. "Accept: */*")
+      # make every script tool refuse to run; don't forward standard client headers.
+      HOLMES_PASSTHROUGH_BLOCKED_HEADERS: "authorization,cookie,set-cookie,accept,accept-encoding,accept-language,user-agent,content-type,content-length,connection,host,origin,referer,x-forwarded-for,x-real-ip"
+    volumes:
+      - ./local-sre/config.yaml:/data/config.yaml:ro
+      - ./local-sre/toolsets:/app/local-sre/toolsets:ro
+      # Optional: ./local-sre/setup.sh copies ~/.kube/config here, readable by the docker group.
+      - ./local-sre/.kube:/kube:ro
+      # Host filesystem, read-only, for disk usage and OS identity. As 'nobody' the agent
+      # can only read world-readable files here (not ~/.ssh or 0750 home directories).
+      - /:/host:ro,rslave
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/log/journal:/var/log/journal:ro
+      - /run/log/journal:/run/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+      - /run/systemd/system:/run/systemd/system:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${HOLMES_PORT}/healthz >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
+
+  ui:
+    build: ./local-sre/ui
+    image: holmes-local-ui:latest
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    environment:
+      UI_PORT: "${UI_PORT:-8088}"
+      HOLMES_PORT: "${HOLMES_PORT:-5050}"
+    depends_on:
+      agent:
+        condition: service_healthy

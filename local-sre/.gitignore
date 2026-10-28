@@ -1,0 +1,9 @@
+.env
+.kube/
+ui/node_modules/
+ui/dist/
+!config.yaml
+# written at runtime by run.sh (HOLMES_CONFIGPATH_DIR=local-sre)
+config_hashes
+toolsets_status.json
+bash_approved_prefixes.yaml
